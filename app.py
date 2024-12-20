@@ -1,22 +1,23 @@
-import json
+import streamlit as st
 import torch
 import nltk
 import pickle
 import random
-from datetime import datetime
 import numpy as np
 import pandas as pd
 
 from nnet import NeuralNet
 from nltk_utils import bag_of_words
-from flask import Flask, render_template, url_for, request, jsonify
 
-random.seed(datetime.now().timestamp())
+# Random seed for reproducibility
+random.seed()
 
+# Device setup
 device = torch.device('cpu')
 FILE = "models/data.pth"
 model_data = torch.load(FILE)
 
+# Model parameters
 input_size = model_data['input_size']
 hidden_size = model_data['hidden_size']
 output_size = model_data['output_size']
@@ -24,31 +25,41 @@ all_words = model_data['all_words']
 tags = model_data['tags']
 model_state = model_data['model_state']
 
+# Load the trained model
 nlp_model = NeuralNet(input_size, hidden_size, output_size).to(device)
 nlp_model.load_state_dict(model_state)
 nlp_model.eval()
 
+# Load datasets
 diseases_description = pd.read_csv("data/symptom_Description.csv")
-diseases_description['Disease'] = diseases_description['Disease'].apply(lambda x: x.lower().strip(" "))
+diseases_description['Disease'] = diseases_description['Disease'].str.lower().str.strip()
 
 disease_precaution = pd.read_csv("data/symptom_precaution.csv")
-disease_precaution['Disease'] = disease_precaution['Disease'].apply(lambda x: x.lower().strip(" "))
+disease_precaution['Disease'] = disease_precaution['Disease'].str.lower().str.strip()
 
 symptom_severity = pd.read_csv("data/Symptom-severity.csv")
-symptom_severity = symptom_severity.applymap(lambda s: s.lower().strip(" ").replace(" ", "") if type(s) == str else s)
+symptom_severity = symptom_severity.applymap(
+    lambda s: s.lower().strip().replace(" ", "") if isinstance(s, str) else s
+)
 
-
+# Load symptom list and prediction model
 with open('data/list_of_symptoms.pickle', 'rb') as data_file:
     symptoms_list = pickle.load(data_file)
 
-with open('models/fitted_model.pickle2', 'rb') as modelFile:
-    prediction_model = pickle.load(modelFile)
+with open('models/fitted_model.pickle2', 'rb') as model_file:
+    prediction_model = pickle.load(model_file)
 
-user_symptoms = set()
+# Initialize Streamlit app
+st.title("Symptom Checker")
+st.write("A symptom-based disease prediction system. Enter symptoms one by one.")
 
-app = Flask(__name__)
+# Initialize session state for symptoms
+if "user_symptoms" not in st.session_state:
+    st.session_state["user_symptoms"] = set()
+
 
 def get_symptom(sentence):
+    """Predicts the most probable symptom from the sentence."""
     sentence = nltk.word_tokenize(sentence)
     X = bag_of_words(sentence, all_words)
     X = X.reshape(1, X.shape[0])
@@ -59,73 +70,54 @@ def get_symptom(sentence):
     tag = tags[predicted.item()]
 
     probs = torch.softmax(output, dim=1)
-    prob = probs[0][predicted.item()]
-    prob = prob.item()
+    prob = probs[0][predicted.item()].item()
 
     return tag, prob
 
-@app.route('/')
-def index():
-    data = []
-    user_symptoms.clear()
-    file = open("static/assets/files/ds_symptoms.txt", "r")
-    all_symptoms = file.readlines()
-    for s in all_symptoms:
-        data.append(s.replace("'", "").replace("_", " ").replace(",\n", ""))
-    data = json.dumps(data)
 
-    return render_template('index.html', data=data)
+# Input and prediction
+sentence = st.text_input("Enter a symptom (type 'done' when finished):")
 
-
-@app.route('/symptom', methods=['GET', 'POST'])
-def predict_symptom():
-    print("Request json:", request.json)
-    sentence = request.json['sentence']
-    if sentence.replace(".", "").replace("!","").lower().strip() == "done":
-
-        if not user_symptoms:
-            response_sentence = random.choice(
-                ["I can't know what disease you may have if you don't enter any symptoms :)",
-                "Meddy can't know the disease if there are no symptoms...",
-                "You first have to enter some symptoms!"])
+if sentence:
+    if sentence.lower().strip() == "done":
+        if not st.session_state["user_symptoms"]:
+            st.warning("Please enter some symptoms before concluding.")
         else:
-            x_test = []
-            
-            for each in symptoms_list: 
-                if each in user_symptoms:
-                    x_test.append(1)
-                else: 
-                    x_test.append(0)
+            x_test = [1 if symptom in st.session_state["user_symptoms"] else 0 for symptom in symptoms_list]
+            x_test = np.asarray(x_test)
 
-            x_test = np.asarray(x_test)            
-            disease = prediction_model.predict(x_test.reshape(1,-1))[0]
-            print(disease)
+            disease = prediction_model.predict(x_test.reshape(1, -1))[0].strip().lower()
+            description = diseases_description.loc[diseases_description['Disease'] == disease, 'Description'].iloc[0]
+            precaution = disease_precaution[disease_precaution['Disease'] == disease]
 
-            description = diseases_description.loc[diseases_description['Disease'] == disease.strip(" ").lower(), 'Description'].iloc[0]
-            precaution = disease_precaution[disease_precaution['Disease'] == disease.strip(" ").lower()]
-            precautions = 'Precautions: ' + precaution.Precaution_1.iloc[0] + ", " + precaution.Precaution_2.iloc[0] + ", " + precaution.Precaution_3.iloc[0] + ", " + precaution.Precaution_4.iloc[0]
-            response_sentence = "It looks to me like you have " + disease + ". <br><br> <i>Description: " + description + "</i>" + "<br><br><b>"+ precautions + "</b>"
-            
-            severity = []
+            precautions = ", ".join(
+                precaution[f'Precaution_{i}'].iloc[0] for i in range(1, 5)
+            )
 
-            for each in user_symptoms: 
-                severity.append(symptom_severity.loc[symptom_severity['Symptom'] == each.lower().strip(" ").replace(" ", ""), 'weight'].iloc[0])
-                
+            st.success(f"Prediction: {disease.capitalize()}")
+            st.write(f"**Description:** {description}")
+            st.write(f"**Precautions:** {precautions}")
+
+            severity = [
+                symptom_severity.loc[
+                    symptom_severity['Symptom'] == symptom.lower().replace(" ", ""), 'weight'
+                ].iloc[0]
+                for symptom in st.session_state["user_symptoms"]
+            ]
+
             if np.mean(severity) > 4 or np.max(severity) > 5:
-                response_sentence = response_sentence + "<br><br>Considering your symptoms are severe, and Meddy isn't a real doctor, you should consider talking to one. :)"
+                st.warning("Symptoms indicate high severity. Please consult a doctor.")
 
-            user_symptoms.clear()
-            severity.clear()
- 
+            st.session_state["user_symptoms"].clear()
     else:
         symptom, prob = get_symptom(sentence)
-        print("Symptom:", symptom, ", prob:", prob)
-        if prob > .5:
-            response_sentence = f"Hmm, I'm {(prob * 100):.2f}% sure this is " + symptom + "."
-            user_symptoms.add(symptom)
+        if prob > 0.5:
+            st.session_state["user_symptoms"].add(symptom)
+            st.success(f"Identified symptom: {symptom} ({prob * 100:.2f}%)")
         else:
-            response_sentence = "I'm sorry, but I don't understand you."
+            st.error("Sorry, I couldn't recognize the symptom.")
 
-        print("User symptoms:", user_symptoms)
-
-    return jsonify(response_sentence.replace("_", " "))
+# Display current symptoms
+if st.session_state["user_symptoms"]:
+    st.write("Current symptoms:")
+    st.write(", ".join(st.session_state["user_symptoms"]))
